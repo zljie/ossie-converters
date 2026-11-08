@@ -124,3 +124,97 @@ jobs:
           path: ${{ runner.temp }}/pr121-evidence/
           retention-days: 7
           if-no-files-found: error
+
+  publish-candidate:
+    needs: validate
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    env:
+      ORIGINAL: 336c709e474b413baec6a25f3ec2022fa402eeae
+      UPSTREAM: 532585180b0bfdb8f29b1c3035719a31785c1883
+      ORIGINAL_BRANCH: fix/dbt-ratio-private-helpers-20261102
+      CANDIDATE_BRANCH: verify/pr121-tested-integration-20261108
+    steps:
+      - name: Checkout verifier with fork-only publication credentials
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Download the four successful validation records
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'pr121-integration-python-*' --dir "$RUNNER_TEMP/pr121-validated"
+      - name: Rebuild and compare the exact validated tree
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test "$(git ls-remote --exit-code https://github.com/apache/ossie-converters.git refs/heads/main | cut -f1)" = "$UPSTREAM"
+          test -z "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH")"
+          mkdir -p "$RUNNER_TEMP/pr121-publish-tools" "$RUNNER_TEMP/pr121-publication"
+          cp .pr121-validation/*.py "$RUNNER_TEMP/pr121-publish-tools/"
+          git config user.name 'zljie'
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$ORIGINAL"
+          git submodule update --init --recursive
+          python "$RUNNER_TEMP/pr121-publish-tools/integrate_pr121.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --regression-file "$RUNNER_TEMP/pr121-publish-tools/test_ratio_helpers_meta_integration.py" \
+            --evidence "$RUNNER_TEMP/pr121-publication/prepared.json"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((root / 'pr121-publication/prepared.json').read_text())
+          records = list((root / 'pr121-validated').glob('*/prepared.json'))
+          if len(records) != 4:
+              raise SystemExit('Four complete validation records are required')
+          versions = set()
+          for path in records:
+              record = json.loads(path.read_text())
+              versions.add(record['python_version'])
+              for field in ('original', 'upstream', 'tree', 'changed_files'):
+                  if record[field] != expected[field]:
+                      raise SystemExit(f'Tree or source mismatch: {path}: {field}')
+              if not all(record.get(k) is True for k in ('tests_executed', 'baseline_passed', 'integration_passed')):
+                  raise SystemExit(f'Unverified tests: {path}')
+              for filename in ('baseline.xml', 'integration.xml'):
+                  report = ET.parse(path.parent / filename).getroot()
+                  cases = list(report.iter('testcase'))
+                  if not cases or list(report.iter('failure')) or list(report.iter('error')):
+                      raise SystemExit(f'Test evidence failed: {path.parent / filename}')
+          if versions != {'3.11', '3.12', '3.13', '3.14'}:
+              raise SystemExit('Unexpected Python matrix')
+          print('All four matrices validated identical tree:', expected['tree'])
+          PY
+      - name: Publish tested candidate without touching the original PR branch
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --cached --check
+          git commit -m 'Merge upstream main and preserve public ratio helper provenance'
+          test "$(git show -s --format=%P HEAD)" = "$ORIGINAL $UPSTREAM"
+          test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test -z "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH")"
+          git push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/pr121-publication/candidate-sha.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/pr121-publication/tree-sha.txt"
+          echo "Validated candidate commit: $(git rev-parse HEAD)"
+          echo 'Original PR branch was not changed by this workflow.'
+      - name: Upload publication record
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr121-publication-record
+          path: ${{ runner.temp }}/pr121-publication/
+          retention-days: 7
+          if-no-files-found: warn
