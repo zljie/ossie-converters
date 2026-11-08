@@ -1,0 +1,126 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: PR 121 isolated integration validation
+
+on:
+  push:
+    branches: ['verify/pr121-integration-20261108']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr121-isolated-validation
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      ORIGINAL: 336c709e474b413baec6a25f3ec2022fa402eeae
+      UPSTREAM: 532585180b0bfdb8f29b1c3035719a31785c1883
+    steps:
+      - name: Checkout verification tools only
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Pin sources and preserve verifier outside worktree
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr121-evidence" "$RUNNER_TEMP/pr121-tools"
+          cp .pr121-validation/*.py "$RUNNER_TEMP/pr121-tools/"
+          git config user.name 'zljie'
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$UPSTREAM"
+          git submodule sync --recursive
+          git submodule update --init --recursive
+      - name: Test unmodified upstream baseline
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/pr121-evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/pr121-evidence/baseline.log"
+      - name: Prepare reviewed integration without publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach "$ORIGINAL"
+          git submodule update --init --recursive
+          python "$RUNNER_TEMP/pr121-tools/integrate_pr121.py" \
+            --repo "$GITHUB_WORKSPACE" \
+            --regression-file "$RUNNER_TEMP/pr121-tools/test_ratio_helpers_meta_integration.py" \
+            --evidence "$RUNNER_TEMP/pr121-evidence/prepared.json"
+          git submodule update --init --recursive
+      - name: Run complete dbt suite and cross-feature regressions
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/pr121-evidence/integration.xml" 2>&1 | tee "$RUNNER_TEMP/pr121-evidence/integration.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'pr121-evidence' / 'prepared.json'
+          data = json.loads(p.read_text())
+          data['tests_executed'] = True
+          data['baseline_passed'] = True
+          data['integration_passed'] = True
+          data['python_version'] = '${{ matrix.python }}'
+          p.write_text(json.dumps(data, indent=2) + '\n')
+          PY
+      - name: Collect exact staged tree and failure evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/pr121-evidence"
+          git status --porcelain > "$RUNNER_TEMP/pr121-evidence/git-status.txt"
+          git diff --name-only --diff-filter=U > "$RUNNER_TEMP/pr121-evidence/conflicts.txt"
+          git diff --cached "$UPSTREAM" --binary > "$RUNNER_TEMP/pr121-evidence/integration.patch"
+          if test -f "$RUNNER_TEMP/pr121-evidence/prepared.json"; then
+            git diff --cached --check
+            git write-tree > "$RUNNER_TEMP/pr121-evidence/tree-sha.txt"
+            git diff --cached --name-only -z "$UPSTREAM" | tar --null -T - -czf "$RUNNER_TEMP/pr121-evidence/changed-files.tar.gz"
+          fi
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: pr121-integration-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/pr121-evidence/
+          retention-days: 7
+          if-no-files-found: error
