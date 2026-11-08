@@ -16,17 +16,18 @@
 # under the License.
 
 name: PR 121 isolated integration validation
-
 on:
   push:
     branches: ['verify/pr121-integration-20261108']
-
 permissions:
   contents: read
-
 concurrency:
   group: pr121-isolated-validation
   cancel-in-progress: false
+
+env:
+  ORIGINAL: 336c709e474b413baec6a25f3ec2022fa402eeae
+  UPSTREAM: 532585180b0bfdb8f29b1c3035719a31785c1883
 
 jobs:
   validate:
@@ -37,9 +38,6 @@ jobs:
       fail-fast: false
       matrix:
         python: ['3.11', '3.12', '3.13', '3.14']
-    env:
-      ORIGINAL: 336c709e474b413baec6a25f3ec2022fa402eeae
-      UPSTREAM: 532585180b0bfdb8f29b1c3035719a31785c1883
     steps:
       - name: Checkout verification tools only
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -96,10 +94,8 @@ jobs:
           from pathlib import Path
           p = Path(os.environ['RUNNER_TEMP']) / 'pr121-evidence' / 'prepared.json'
           data = json.loads(p.read_text())
-          data['tests_executed'] = True
-          data['baseline_passed'] = True
-          data['integration_passed'] = True
-          data['python_version'] = '${{ matrix.python }}'
+          data.update(tests_executed=True, baseline_passed=True, integration_passed=True,
+                      python_version='${{ matrix.python }}')
           p.write_text(json.dumps(data, indent=2) + '\n')
           PY
       - name: Collect exact staged tree and failure evidence
@@ -134,8 +130,6 @@ jobs:
       contents: write
       actions: read
     env:
-      ORIGINAL: 336c709e474b413baec6a25f3ec2022fa402eeae
-      UPSTREAM: 532585180b0bfdb8f29b1c3035719a31785c1883
       ORIGINAL_BRANCH: fix/dbt-ratio-private-helpers-20261102
       CANDIDATE_BRANCH: verify/pr121-tested-integration-20261108
     steps:
@@ -157,7 +151,9 @@ jobs:
           set -euo pipefail
           test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
           test "$(git ls-remote --exit-code https://github.com/apache/ossie-converters.git refs/heads/main | cut -f1)" = "$UPSTREAM"
-          test -z "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH")"
+          # The authorized connector imported this exact upstream baseline.
+          # This workflow may append dbt changes only, not change workflows.
+          test "$(git ls-remote --exit-code origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)" = "$UPSTREAM"
           mkdir -p "$RUNNER_TEMP/pr121-publish-tools" "$RUNNER_TEMP/pr121-publication"
           cp .pr121-validation/*.py "$RUNNER_TEMP/pr121-publish-tools/"
           git config user.name 'zljie'
@@ -174,7 +170,8 @@ jobs:
           from pathlib import Path
           import xml.etree.ElementTree as ET
           root = Path(os.environ['RUNNER_TEMP'])
-          expected = json.loads((root / 'pr121-publication/prepared.json').read_text())
+          output = root / 'pr121-publication/prepared.json'
+          expected = json.loads(output.read_text())
           records = list((root / 'pr121-validated').glob('*/prepared.json'))
           if len(records) != 4:
               raise SystemExit('Four complete validation records are required')
@@ -189,11 +186,13 @@ jobs:
                   raise SystemExit(f'Unverified tests: {path}')
               for filename in ('baseline.xml', 'integration.xml'):
                   report = ET.parse(path.parent / filename).getroot()
-                  cases = list(report.iter('testcase'))
-                  if not cases or list(report.iter('failure')) or list(report.iter('error')):
+                  if not list(report.iter('testcase')) or list(report.iter('failure')) or list(report.iter('error')):
                       raise SystemExit(f'Test evidence failed: {path.parent / filename}')
           if versions != {'3.11', '3.12', '3.13', '3.14'}:
               raise SystemExit('Unexpected Python matrix')
+          expected.update(tests_executed=True, baseline_passed=True,
+                          integration_passed=True, python_versions=sorted(versions))
+          output.write_text(json.dumps(expected, indent=2) + '\n')
           print('All four matrices validated identical tree:', expected['tree'])
           PY
       - name: Publish tested candidate without touching the original PR branch
@@ -204,7 +203,8 @@ jobs:
           git commit -m 'Merge upstream main and preserve public ratio helper provenance'
           test "$(git show -s --format=%P HEAD)" = "$ORIGINAL $UPSTREAM"
           test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
-          test -z "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH")"
+          test "$(git ls-remote --exit-code origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)" = "$UPSTREAM"
+          git diff --quiet "$UPSTREAM" HEAD -- .github
           git push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
           git rev-parse HEAD > "$RUNNER_TEMP/pr121-publication/candidate-sha.txt"
           git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/pr121-publication/tree-sha.txt"
