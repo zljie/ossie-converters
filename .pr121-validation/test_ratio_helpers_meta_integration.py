@@ -17,7 +17,10 @@
 """PR #121/#53 integration: user metadata and generated provenance coexist."""
 from copy import deepcopy
 import json
+import sqlite3
 import pytest
+import sqlglot
+from sqlglot import exp
 from ossie import OssieCustomExtension, OssieDocument, OssieVendor
 from metricflow_semantic_interfaces.implementations.semantic_manifest import PydanticSemanticManifest
 from metricflow_semantic_interfaces.implementations.saved_query import PydanticSavedQuery, PydanticSavedQueryQueryParams
@@ -47,13 +50,35 @@ def _user_metadata(meta):
             result.pop("ossie")
     return result
 
+def _canonical_sql(expression):
+    # These fixtures deliberately contain one dataset. Normalize only that
+    # qualifier and SQL parser spelling, not the expression's operations.
+    tree = sqlglot.parse_one(expression)
+    for column in tree.find_all(exp.Column):
+        assert column.table in ("", "orders")
+        column.set("table", None)
+    return tree.sql()
+
+def _evaluate(expression):
+    # Includes a NULL key and a repeated key, so COUNT and COUNT(DISTINCT)
+    # cannot accidentally be substituted for one another.
+    with sqlite3.connect(":memory:") as connection:
+        connection.execute("CREATE TABLE orders (amount REAL, order_id INTEGER)")
+        connection.executemany("INSERT INTO orders VALUES (?, ?)",
+                               [(12.0, 1), (7.0, 1), (3.0, None), (2.0, 2)])
+        return connection.execute(f"SELECT {expression} FROM orders").fetchone()[0]
+
 @pytest.mark.parametrize("expression", [
     "SUM(orders.amount) / COUNT(orders.order_id)",
     "(SUM(orders.amount) / COUNT(orders.order_id)) / SUM(orders.amount)",
+    "SUM(orders.amount) / COUNT(DISTINCT orders.order_id)",
+    "(SUM(orders.amount) / COUNT(DISTINCT orders.order_id)) / SUM(orders.amount)",
 ])
 def test_metadata_and_ratio_remain_stable_across_three_serialized_round_trips(expression):
     doc = _document(expression=expression)
     normalized_expression = None
+    previous_sql = None
+    expected_value = _evaluate(expression)
     for _ in range(3):
         doc_before = doc.model_dump_json()
         forward = OssieToMSIConverter().convert(doc)
@@ -72,10 +97,15 @@ def test_metadata_and_ratio_remain_stable_across_three_serialized_round_trips(ex
         extensions = [e for e in metric.custom_extensions if e.vendor_name == OssieVendor.DBT.value]
         assert len(extensions) == 1
         assert _user_metadata(json.loads(extensions[0].data)) == USER_META
-        current_expression = metric.expression.dialects[0].expression
+        current_sql = metric.expression.dialects[0].expression
+        assert _evaluate(current_sql) == pytest.approx(expected_value)
+        current_expression = _canonical_sql(current_sql)
         if normalized_expression is not None:
             assert current_expression == normalized_expression
+            if "COUNT(DISTINCT" in expression:
+                assert current_sql == previous_sql
         normalized_expression = current_expression
+        previous_sql = current_sql
         doc = OssieDocument.model_validate_json(reverse.output.model_dump_json())
 
 def test_editing_restored_user_metadata_invalidates_the_original_signature():
