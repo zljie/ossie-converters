@@ -91,7 +91,7 @@ def test_restored_datatype_is_applied_before_signing_ratio_family(datatype):
     meta = deepcopy(USER_META)
     meta["ossie"]["datatype"] = "Integer"
     doc = _document(meta=meta)
-    doc.metrics[0].datatype = datatype
+    doc = doc.model_copy(update={"metrics": [doc.metrics[0].model_copy(update={"datatype": datatype})]})
     expected = deepcopy(meta)
     expected["ossie"]["datatype"] = datatype.value
     for _ in range(3):
