@@ -1,0 +1,92 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR 121 CLI defect reproduction
+on:
+  push:
+    branches: ['verify/pr121-cli-repro-20261111']
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+          submodules: recursive
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Verify original code and baseline tests
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/evidence"
+          git diff --exit-code b2178d04cb19733a20fdc91b834ba248cef82fca -- dbt ossie
+          uv sync --frozen --python 3.13
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline.log"
+      - name: Inspect exact installed parser and COUNT rewrite
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv run --no-sync python - <<'PY'
+          import inspect, os
+          from pathlib import Path
+          from metricflow_semantic_interfaces.transformations import convert_count, semantic_manifest_transformer
+          from metricflow_semantics.model import dbt_manifest_parser
+          output = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          for module in (convert_count, semantic_manifest_transformer, dbt_manifest_parser):
+              (output / (module.__name__.rsplit('.', 1)[-1] + '.py')).write_text(inspect.getsource(module))
+          PY
+      - name: Run new CLI regressions against unmodified code and require the reported failure
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -uo pipefail
+          cp ../.p0-cli/test_ratio_cli.py tests/test_ratio_cli.py
+          uv run --no-sync pytest -q -s tests/test_ratio_cli.py --junitxml="$RUNNER_TEMP/evidence/reproduction.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/reproduction.log"
+          status=${PIPESTATUS[0]}
+          test "$status" = 1 || exit 1
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          report = ET.parse(root / 'reproduction.xml').getroot()
+          assert not list(report.iter('error'))
+          failed = [c.attrib['name'] for c in report.iter('testcase') if c.find('failure') is not None]
+          passed = [c.attrib['name'] for c in report.iter('testcase') if c.find('failure') is None]
+          assert any('[count_column]' in n for n in failed), failed
+          assert any('[count_distinct]' in n for n in passed), passed
+          result = {'original_head':'b2178d04cb19733a20fdc91b834ba248cef82fca', 'defect_reproduced':True, 'failed':failed, 'passed':passed}
+          (root / 'reproduction.json').write_text(json.dumps(result, indent=2))
+          print(json.dumps(result, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr121-cli-reproduction
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+          if-no-files-found: error
