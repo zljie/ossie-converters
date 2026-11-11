@@ -33,6 +33,7 @@ def replace_once(text, old, new):
 
 original, upstream = os.environ['ORIGINAL'], os.environ['UPSTREAM']
 assert git('rev-parse', 'HEAD') == original
+subprocess.run(['git', 'submodule', 'update', '--init', '--recursive'], check=True)
 assert not git('status', '--porcelain', '--untracked-files=no')
 subprocess.run(['git', 'merge', '--no-commit', '--no-ff', upstream], check=True)
 path = Path('dbt/src/ossie_dbt/ratio_helpers.py')
