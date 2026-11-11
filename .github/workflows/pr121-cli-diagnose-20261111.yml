@@ -1,0 +1,95 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR 121 second-round normalization diagnosis
+on:
+  push:
+    branches: ['verify/pr121-cli-diagnose-20261111']
+permissions:
+  contents: read
+env:
+  ORIGINAL: b2178d04cb19733a20fdc91b834ba248cef82fca
+  UPSTREAM: 62b1d9eec6fcd1270bdeb06f1e262a9c9f8106a3
+jobs:
+  diagnose:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Prepare exact failing candidate
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence"
+          cp .p0-cli/*.py "$RUNNER_TEMP/tools/"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$ORIGINAL"
+          python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/tools/test_ratio_helpers_cli.py" "$RUNNER_TEMP/evidence/prepared.json"
+          git submodule update --init --recursive
+      - name: Record raw and parser-transformed definitions across three round trips
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python 3.13
+          uv run --no-sync python - <<'PY'
+          import inspect, json, os, difflib
+          from pathlib import Path
+          from metricflow_semantics.model.dbt_manifest_parser import parse_manifest_from_dbt_generated_manifest
+          from metricflow_semantic_interfaces.transformations.pydantic_rule_set import PydanticSemanticManifestTransformRuleSet
+          from ossie_dbt.ossie_to_msi import OssieToMSIConverter
+          from ossie_dbt.msi_to_ossie import MSIToOssieConverter
+          from ossie_dbt.ratio_helpers import _definition, _signature, unchanged_ratio_helpers
+          from tests.test_ratio_helpers_cli import _document
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          rules = PydanticSemanticManifestTransformRuleSet().general_metric_update_rules
+          for rule in rules:
+              module = inspect.getmodule(rule)
+              (root / (module.__name__.rsplit('.', 1)[-1] + '.py')).write_text(inspect.getsource(module))
+          document = _document()
+          output = []
+          for iteration in range(3):
+              raw = OssieToMSIConverter().convert(document).output
+              parsed = parse_manifest_from_dbt_generated_manifest(raw.json(by_alias=True, exclude_none=True))
+              raw_defs = [_definition(m) for m in sorted(raw.metrics, key=lambda m:m.name)]
+              parsed_defs = [_definition(m) for m in sorted(parsed.metrics, key=lambda m:m.name)]
+              record = {'iteration': iteration + 1, 'raw_signature': _signature(raw.metrics), 'parsed_signature': _signature(parsed.metrics),
+                        'raw_families': unchanged_ratio_helpers(raw.metrics), 'parsed_families': unchanged_ratio_helpers(parsed.metrics),
+                        'raw':raw_defs, 'parsed':parsed_defs}
+              output.append(record)
+              print('ROUND', iteration + 1, record['raw_families'], record['parsed_families'])
+              print('\n'.join(difflib.unified_diff(json.dumps(raw_defs,indent=2,sort_keys=True).splitlines(),json.dumps(parsed_defs,indent=2,sort_keys=True).splitlines())))
+              document = MSIToOssieConverter().convert(parsed).output
+          (root / 'normalization-diagnosis.json').write_text(json.dumps(output, indent=2))
+          PY
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr121-cli-normalization-diagnosis
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
