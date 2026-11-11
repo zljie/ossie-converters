@@ -36,65 +36,34 @@ assert git('rev-parse', 'HEAD') == original
 subprocess.run(['git', 'submodule', 'update', '--init', '--recursive'], check=True)
 assert not git('status', '--porcelain', '--untracked-files=no')
 subprocess.run(['git', 'merge', '--no-commit', '--no-ff', upstream], check=True)
+tools = Path(__file__).parent
 path = Path('dbt/src/ossie_dbt/ratio_helpers.py')
-text = path.read_text()
-text = replace_once(text,
-    'from metricflow_semantic_interfaces.implementations.metric import PydanticMetric',
-    'from metricflow_semantic_interfaces.errors import ModelTransformError\nfrom metricflow_semantic_interfaces.implementations.metric import PydanticMetric\nfrom metricflow_semantic_interfaces.implementations.project_configuration import PydanticProjectConfiguration\nfrom metricflow_semantic_interfaces.implementations.semantic_manifest import PydanticSemanticManifest\nfrom metricflow_semantic_interfaces.transformations.convert_count import ConvertCountMetricToSumRule')
-text = replace_once(text,
-    'def _signature(metrics: Sequence[PydanticMetric]) -> str:\n    payload',
-    '''def _signature(metrics: Sequence[PydanticMetric], *, normalize_count: bool = True) -> str:
-    if normalize_count:
-        # The CLI parser applies this same rule before reverse conversion. Use
-        # a private copy so signing never changes public helper definitions.
-        # The rule is idempotent: already-rewritten SUM metrics stay unchanged.
-        manifest = PydanticSemanticManifest(
-            semantic_models=[],
-            metrics=deepcopy(list(metrics)),
-            project_configuration=PydanticProjectConfiguration(),
-        )
-        metrics = ConvertCountMetricToSumRule.transform_model(manifest).metrics
-    payload''')
-text = replace_once(text, '"version": 1,', '"version": 2,')
-text = replace_once(text,
-    '    Compare before MetricFlow transforms definitions (e.g. COUNT into SUM). Scan\n    all external serialized definitions conservatively for helper names, including',
-    '    Version 2 compares COUNT-normalized definitions before or after CLI parsing.\n    Version 1 remains valid only for its exact original definitions; when they\n    have already changed, retain the helpers rather than infer ownership. Scan\n    all external serialized definitions conservatively for helper names, including')
-text = replace_once(text, 'marker.get("version") != 1', 'marker.get("version") not in (1, 2)')
-text = replace_once(text,
-    '        if marker.get("signature") != _signature([index[name] for name in group]):\n            continue',
-    '''        try:
-            signature = _signature(
-                [index[name] for name in group], normalize_count=marker["version"] == 2
-            )
-        except ModelTransformError:
-            # Invalid/edited COUNT definitions are not proof of ownership.
-            # The converter's normal validation still reports invalid input.
-            continue
-        if marker.get("signature") != signature:
-            continue''')
-text = replace_once(text, '# Generated metrics currently have no config; retain any future annotations.',
-    '# Retain user annotations while adding converter provenance to the owner.')
+assert git('hash-object', str(path)) == '28193710fbf8fcd0710696e2c3cb6004e2ef0729'
+text = (tools / 'ratio_helpers.py').read_text()
 compile(text, str(path), 'exec')
 path.write_text(text)
 test_path = Path('dbt/tests/test_ratio_helpers_cli.py')
 assert not test_path.exists()
-test_path.write_text(Path(sys.argv[1]).read_text())
+tests = Path(sys.argv[1]).read_text() + (tools / 'additional_tests.py').read_text()
+compile(tests, str(test_path), 'exec')
+test_path.write_text(tests)
+existing_tests = Path('dbt/tests/test_ossie_to_msi.py')
+existing_tests.write_text(replace_once(existing_tests.read_text(), 'assert provenance["version"] == 1', 'assert provenance["version"] == 2'))
 readme = Path('dbt/README.md')
-doc = readme.read_text()
-doc = replace_once(doc, '## Development', '''### Generated ratio helper provenance
+doc = replace_once(readme.read_text(), '## Development', '''### Generated ratio helper provenance
 
-New helper families use provenance version 2. Signatures apply MetricFlow's
-COUNT-to-SUM normalization to a private copy on both generation and inspection,
-so the raw converter API and the CLI's dbt manifest parser agree. This does not
-make the helpers private or rewrite their emitted definitions. All other
+New helper families use provenance version 2. Signatures reuse MetricFlow's
+COUNT-to-SUM, boolean-SUM, and MEDIAN-to-percentile rules on a private copy,
+so the raw converter API and the CLI's dbt manifest parser agree, including
+later round trips that re-express a COUNT as a boolean aggregation. This does
+not make the helpers private or rewrite their emitted definitions. All other
 semantic fields and external-consumer checks remain part of the conservative
 retention contract. Version 1 markers are accepted only when their exact original
 definitions still match; otherwise helpers are retained rather than guessed.
 
 ## Development''')
 readme.write_text(doc)
-subprocess.run(['git', 'add', str(path), str(test_path), str(readme)], check=True)
-# Check only the proposed PR diff, not whitespace inherited from upstream.
+subprocess.run(['git', 'add', str(path), str(test_path), str(existing_tests), str(readme)], check=True)
 subprocess.run(['git', 'diff', '--cached', '--check', upstream], check=True)
 assert not git('diff', '--name-only', '--diff-filter=U')
 changed = git('diff', '--cached', '--name-only', upstream).splitlines()
