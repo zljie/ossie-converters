@@ -121,7 +121,7 @@ jobs:
           set -euo pipefail
           git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
           if test -f "$RUNNER_TEMP/evidence/prepared.json"; then
-            git diff --cached --check
+            git diff --cached --check "$UPSTREAM"
             git write-tree > "$RUNNER_TEMP/evidence/tree-sha.txt"
             git diff --cached "$UPSTREAM" --binary > "$RUNNER_TEMP/evidence/integration.patch"
             git diff --cached --name-only -z "$UPSTREAM" | tar --null -T - -czf "$RUNNER_TEMP/evidence/changed-files.tar.gz"
@@ -189,7 +189,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          git diff --cached --check
+          git diff --cached --check "$UPSTREAM"
           git commit -m 'Merge upstream and normalize ratio helper provenance for CLI parsing'
           test "$(git show -s --format=%P HEAD)" = "$ORIGINAL $UPSTREAM"
           git diff --quiet "$UPSTREAM" HEAD -- .github

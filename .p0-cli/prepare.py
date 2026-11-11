@@ -94,7 +94,8 @@ definitions still match; otherwise helpers are retained rather than guessed.
 ## Development''')
 readme.write_text(doc)
 subprocess.run(['git', 'add', str(path), str(test_path), str(readme)], check=True)
-subprocess.run(['git', 'diff', '--cached', '--check'], check=True)
+# Check only the proposed PR diff, not whitespace inherited from upstream.
+subprocess.run(['git', 'diff', '--cached', '--check', upstream], check=True)
 assert not git('diff', '--name-only', '--diff-filter=U')
 changed = git('diff', '--cached', '--name-only', upstream).splitlines()
 assert changed and all(name.startswith('dbt/') for name in changed), changed
