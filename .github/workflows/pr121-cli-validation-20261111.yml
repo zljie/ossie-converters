@@ -1,0 +1,205 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR 121 CLI fix full validation
+on:
+  push:
+    branches: ['verify/pr121-cli-fix-20261111']
+permissions:
+  contents: read
+env:
+  ORIGINAL: b2178d04cb19733a20fdc91b834ba248cef82fca
+  UPSTREAM: 62b1d9eec6fcd1270bdeb06f1e262a9c9f8106a3
+  ORIGINAL_BRANCH: fix/dbt-ratio-private-helpers-20261102
+  CANDIDATE_BRANCH: verify/pr121-cli-tested-20261111
+jobs:
+  validate:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Preserve verification tools and pin exact sources
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/p0-tools" "$RUNNER_TEMP/evidence"
+          cp .p0-cli/*.py "$RUNNER_TEMP/p0-tools/"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$ORIGINAL"
+          git submodule update --init --recursive
+      - name: Require actual COUNT regression on the original PR code
+        if: matrix.python == '3.13'
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}'
+          test ! -e tests/test_ratio_cli.py
+          cp "$RUNNER_TEMP/p0-tools/test_ratio_cli.py" tests/test_ratio_cli.py
+          set +e
+          uv run --no-sync pytest -q -s tests/test_ratio_cli.py --junitxml="$RUNNER_TEMP/evidence/red.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/red.log"
+          status=${PIPESTATUS[0]}
+          set -e
+          test "$status" = 1
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          report = ET.parse(root / 'red.xml').getroot()
+          assert not list(report.iter('error'))
+          failed = [c.attrib['name'] for c in report.iter('testcase') if c.find('failure') is not None]
+          passed = [c.attrib['name'] for c in report.iter('testcase') if c.find('failure') is None]
+          assert any('[count_column]' in name for name in failed)
+          assert any('[count_distinct]' in name for name in passed)
+          (root / 'reproduction.json').write_text(json.dumps({'defect_reproduced': True, 'failed': failed, 'passed': passed}, indent=2))
+          PY
+          rm tests/test_ratio_cli.py
+      - name: Test latest unmodified upstream baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach "$UPSTREAM"
+          git submodule update --init --recursive
+          cd dbt
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline.log"
+      - name: Prepare minimal fix integrated with latest upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git checkout --detach "$ORIGINAL"
+          python "$RUNNER_TEMP/p0-tools/prepare.py" "$RUNNER_TEMP/p0-tools/test_ratio_helpers_cli.py" "$RUNNER_TEMP/evidence/prepared.json"
+          git submodule update --init --recursive
+      - name: Run complete dbt suite including actual CLI and conservative-retention regressions
+        working-directory: dbt
+        shell: bash
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}'
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/evidence/integration.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/integration.log"
+          python - <<'PY'
+          import json, os
+          from pathlib import Path
+          p = Path(os.environ['RUNNER_TEMP']) / 'evidence/prepared.json'
+          record = json.loads(p.read_text())
+          record.update(tests_executed=True, baseline_passed=True, integration_passed=True, python_version='${{ matrix.python }}')
+          p.write_text(json.dumps(record, indent=2) + '\n')
+          PY
+      - name: Collect exact code tree, patch and logs
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+          if test -f "$RUNNER_TEMP/evidence/prepared.json"; then
+            git diff --cached --check
+            git write-tree > "$RUNNER_TEMP/evidence/tree-sha.txt"
+            git diff --cached "$UPSTREAM" --binary > "$RUNNER_TEMP/evidence/integration.patch"
+            git diff --cached --name-only -z "$UPSTREAM" | tar --null -T - -czf "$RUNNER_TEMP/evidence/changed-files.tar.gz"
+          fi
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr121-cli-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/evidence/
+          retention-days: 14
+          if-no-files-found: error
+  publish-candidate:
+    needs: validate
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Download four successful validation records
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'pr121-cli-python-*' --dir "$RUNNER_TEMP/validated"
+      - name: Rebuild exact tested code tree without modifying original PR
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test "$(git ls-remote --exit-code https://github.com/apache/ossie-converters.git refs/heads/main | cut -f1)" = "$UPSTREAM"
+          test "$(git ls-remote --exit-code origin "refs/heads/$CANDIDATE_BRANCH" | cut -f1)" = "$UPSTREAM"
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/publication"
+          cp .p0-cli/*.py "$RUNNER_TEMP/tools/"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$ORIGINAL"
+          python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/tools/test_ratio_helpers_cli.py" "$RUNNER_TEMP/publication/prepared.json"
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((root / 'publication/prepared.json').read_text())
+          records = list((root / 'validated').glob('*/prepared.json'))
+          assert len(records) == 4
+          versions = set()
+          for path in records:
+              record = json.loads(path.read_text())
+              versions.add(record['python_version'])
+              assert all(record[k] == expected[k] for k in ('original', 'upstream', 'tree', 'files'))
+              assert all(record[k] is True for k in ('tests_executed', 'baseline_passed', 'integration_passed'))
+              for name in ('baseline.xml', 'integration.xml'):
+                  report = ET.parse(path.parent / name).getroot()
+                  assert list(report.iter('testcase')) and not list(report.iter('failure')) and not list(report.iter('error')) and not list(report.iter('skipped'))
+          assert versions == {'3.11', '3.12', '3.13', '3.14'}
+          repro = root / 'validated/pr121-cli-python-3.13/reproduction.json'
+          assert json.loads(repro.read_text())['defect_reproduced'] is True
+          print('Four Python versions validated exact tree:', expected['tree'])
+          PY
+      - name: Publish tested candidate branch only
+        shell: bash
+        run: |
+          set -euo pipefail
+          git diff --cached --check
+          git commit -m 'Merge upstream and normalize ratio helper provenance for CLI parsing'
+          test "$(git show -s --format=%P HEAD)" = "$ORIGINAL $UPSTREAM"
+          git diff --quiet "$UPSTREAM" HEAD -- .github
+          test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          git push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/publication/head.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/publication/tree.txt"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        if: always()
+        with:
+          name: pr121-cli-publication
+          path: ${{ runner.temp }}/publication/
+          retention-days: 14
