@@ -1,0 +1,358 @@
+--- a/sigma/src/ossie_sigma/ossie_to_sigma.py
++++ b/sigma/src/ossie_sigma/ossie_to_sigma.py
+@@ -109,7 +109,8 @@
+ 
+ 
+ def _resolve_formula(
+-    expression, dataset_alias: str, element_name: str, issues: list[ConverterIssue]
++    expression, dataset_alias: str, element_name: str, issues: list[ConverterIssue],
++    *, source_table: Optional[str] = None,
+ ) -> Optional[str]:
+     """Prefer native Sigma formula text, then translate the preferred SQL dialect.
+ 
+@@ -126,7 +127,8 @@
+     sql = preferred_sql_expression(expression)
+     if sql is not None:
+         translated = sql_to_sigma_formula(
+-            sql.expression, dataset_alias=dataset_alias, dialect=SQL_DIALECT_READERS[sql.dialect]
++            sql.expression, dataset_alias=dataset_alias, dialect=SQL_DIALECT_READERS[sql.dialect],
++            source_table=source_table,
+         )
+         if translated is not None:
+             return translated
+@@ -274,12 +276,21 @@
+             # the preserved original. The other kinds have no such portable field.
+             source["path"] = dataset.source.split(".")
+ 
++        # Use the source that will actually be emitted, including a native override.
++        # Other source kinds have no warehouse table prefix to infer safely.
++        effective_source = (ext.get("native") or {}).get("source", source)
++        source_table = None
++        if isinstance(effective_source, dict) and effective_source.get("kind") == "warehouse-table":
++            path = effective_source.get("path")
++            if isinstance(path, list) and path and isinstance(path[-1], str) and path[-1]:
++                source_table = path[-1]
++
+         field_ids: dict[str, str] = field_ids_by_dataset.setdefault(dataset.name, {})
+         columns = []
+         for field in dataset.fields or []:
+             field_ext = _sigma_ext(field) or {}
+             col_id = field_ext.get("id") or _stable_id("column", dataset.name, field.name)
+-            column = self._build_column(dataset, field, col_id, field_ext, issues)
++            column = self._build_column(dataset, field, col_id, field_ext, issues, source_table=source_table)
+             if column is None:
+                 continue
+             field_ids[field.name] = col_id
+@@ -320,8 +331,12 @@
+         col_id: str,
+         field_ext: dict[str, Any],
+         issues: list[ConverterIssue],
++        *,
++        source_table: Optional[str] = None,
+     ) -> Optional[dict[str, Any]]:
+-        formula = _resolve_formula(field.expression, dataset.name, f"{dataset.name}.{field.name}", issues)
++        formula = _resolve_formula(
++            field.expression, dataset.name, f"{dataset.name}.{field.name}", issues, source_table=source_table
++        )
+         if formula is None:
+             return None
+ 
+--- a/sigma/src/ossie_sigma/sigma_formula.py
++++ b/sigma/src/ossie_sigma/sigma_formula.py
+@@ -650,7 +650,8 @@
+ 
+ 
+ def sql_to_sigma_formula(
+-    sql: str, dataset_alias: Optional[str] = None, *, dialect: str | type[Dialect] | None = Dialect
++    sql: str, dataset_alias: Optional[str] = None, *, dialect: str | type[Dialect] | None = Dialect,
++    source_table: Optional[str] = None,
+ ) -> Optional[str]:
+     """Best-effort translation from the given SQL dialect into Sigma formula syntax.
+ 
+@@ -658,11 +659,22 @@
+     ``SIGMA``-dialect expression to reuse verbatim). Returns ``None`` if *sql* cannot
+     be parsed, or uses a SQL construct with no Sigma formula-language equivalent —
+     callers should treat that as "not translatable", not fail the conversion.
++
++    ``source_table`` qualifies only a direct reference to this dataset's warehouse
++    column. Computed expressions and element-scoped metric references stay local.
+     """
+     try:
+         tree = sqlglot.parse_one(sql, read=dialect)
+     except Exception:  # noqa: BLE001 - sqlglot raises several internal error types
+         return None
++
++    # A passthrough warehouse column must reference the source, not itself.
++    # Do not apply this to references inside calculated columns or metrics.
++    direct = tree.unnest()
++    if source_table and isinstance(direct, exp.Column):
++        parts = [part.name for part in direct.parts]
++        if len(parts) == 1 or (len(parts) == 2 and parts[0] == dataset_alias):
++            return f"[{source_table}/{parts[-1]}]"
+ 
+     try:
+         return _render_sql_node(tree, dataset_alias)
+--- a/sigma/tests/test_ossie_to_sigma.py
++++ b/sigma/tests/test_ossie_to_sigma.py
+@@ -73,7 +73,7 @@
+     store_sales = next(e for p in spec["pages"] for e in p["elements"] if e["name"] == "store_sales")
+     assert all("id" in c and "formula" in c for c in store_sales["columns"])
+     # Plain passthrough columns get no explicit `name` (matches Sigma's own convention).
+-    plain_column = next(c for c in store_sales["columns"] if c["formula"] == "[ss_sold_date_sk]")
++    plain_column = next(c for c in store_sales["columns"] if c["formula"] == "[store_sales/ss_sold_date_sk]")
+     assert "name" not in plain_column
+ 
+     # Single-dataset metrics are attached to their owning element ...
+@@ -269,7 +269,7 @@
+     result = OssieToSigmaConverter().convert(document)
+     customers, element = result.output["pages"][0]["elements"]
+     assert not customers.get("metrics")
+-    assert [column["formula"] for column in element["columns"]] == ["[amount]", "([amount] * 0.9)"]
++    assert [column["formula"] for column in element["columns"]] == ["[orders/amount]", "([amount] * 0.9)"]
+     assert [metric["formula"] for metric in element["metrics"]] == ["Sum([amount])"]
+     assert not result.issues
+ 
+@@ -488,20 +488,20 @@
+     columns = OssieToSigmaConverter().convert(document).output["pages"][0]["elements"][0]["columns"]
+     kinds = {c["formula"].strip("[]"): c["format"]["kind"] for c in columns if "format" in c}
+     assert kinds == {
+-        "integer": "number",
+-        "decimal": "number",
+-        "float": "number",
++        "t/integer": "number",
++        "t/decimal": "number",
++        "t/float": "number",
+     }
+     # Only number columns get a format. Date columns get none, so Sigma uses its own
+     # default. We must never write the format "date": Sigma does not know that name and
+     # would reject the whole model.
+     assert {c["formula"].strip("[]") for c in columns if "format" not in c} == {
+-        "date",
+-        "datetime",
+-        "datetimetz",
+-        "string",
+-        "boolean",
+-        "time",
++        "t/date",
++        "t/datetime",
++        "t/datetimetz",
++        "t/string",
++        "t/boolean",
++        "t/time",
+     }
+     assert all(c["format"]["kind"] != "date" for c in columns if "format" in c)
+ 
+--- a/sigma/README.md
++++ b/sigma/README.md
+@@ -143,6 +143,24 @@
+ model API validates the whole document before applying any of it, so emitting a placeholder would
+ fail the entire upload rather than degrade one field.
+ 
++### Warehouse source column references
++
++When exporting a direct SQL column reference for a `warehouse-table` source,
++`ossie-to-sigma` writes `[physical_table/column]` instead of `[column]`. The latter
++can refer to the output column itself in Sigma. The table prefix comes from the
++emitted source path, not the Ossie dataset name; renaming the dataset or the output
++field therefore does not change which physical column is read.
++
++This qualification applies only to direct column expressions, including parenthesized
++references and references qualified by the current dataset name. It does not rewrite
++calculated expressions, element-scoped metrics, native `SIGMA` formulas, or formulas
++for `sql`, `table`, `data-model`, `join`, and `union` sources. Native overrides keep
++their existing precedence. Fully qualified SQL paths and source-path parsing are
++outside this change.
++
++See Sigma's [warehouse and calculated column representation example](https://help.sigmacomputing.com/docs/example-representation-data-model-with-a-table-and-a-calculated-column).
++Offline conversion tests do not substitute for querying the resulting model in Sigma.
++
+ ### Relationship resolution
+ 
+ Sigma relationships (`element.relationships[]`) join two *elements*, not two *Ossie datasets*
+--- /dev/null
++++ b/sigma/tests/test_warehouse_source_references.py
+@@ -0,0 +1,184 @@
++# Licensed to the Apache Software Foundation (ASF) under one
++# or more contributor license agreements.  See the NOTICE file
++# distributed with this work for additional information
++# regarding copyright ownership.  The ASF licenses this file
++# to you under the Apache License, Version 2.0 (the
++# "License"); you may not use this file except in compliance
++# with the License.  You may obtain a copy of the License at
++#
++#   http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing,
++# software distributed under the License is distributed on an
++# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
++# KIND, either express or implied.  See the License for the
++# specific language governing permissions and limitations
++# under the License.
++
++"""Issue #195: source-backed fields must not reference themselves in Sigma."""
++
++import json
++import subprocess
++import sys
++
++import pytest
++import yaml
++from ossie import OssieDocument
++
++from ossie_sigma.ossie_to_sigma import OssieToSigmaConverter
++from ossie_sigma.sigma_to_ossie import SigmaToOssieConverter
++
++
++def _extension(data):
++    return [{"vendor_name": "SIGMA", "data": json.dumps(data)}]
++
++
++def _document(*, expression="calendar_date", field_name="calendar_date", dialect="ANSI_SQL",
++              source="db.schema.dim_date_vw", dataset_name="calendar", source_override=None,
++              native_source=None, native_formula=None, sigma_formula=None, primary_sql=False):
++    expr = {"sql": expression} if primary_sql else {
++        "dialects": [{"dialect": dialect, "expression": expression}]}
++    if sigma_formula is not None:
++        expr.setdefault("dialects", []).append({"dialect": "SIGMA", "expression": sigma_formula})
++    field = {"name": field_name, "datatype": "Date", "expression": expr}
++    if native_formula is not None:
++        field["custom_extensions"] = _extension({"native": {"formula": native_formula}})
++    dataset = {"name": dataset_name, "source": source, "primary_key": [field_name], "fields": [field]}
++    extension = {}
++    if source_override is not None:
++        extension["source"] = source_override
++    if native_source is not None:
++        extension["native"] = {"source": native_source}
++    if extension:
++        dataset["custom_extensions"] = _extension(extension)
++    return OssieDocument.model_validate({"version": "0.2.0.dev0", "name": "repro", "datasets": [dataset]})
++
++
++def _element(document):
++    return OssieToSigmaConverter().convert(document).output["pages"][0]["elements"][0]
++
++
++@pytest.mark.parametrize("expression,dialect", [
++    ("calendar_date", "ANSI_SQL"),
++    ('"calendar_date"', "SNOWFLAKE"),
++    ("`calendar_date`", "DATABRICKS"),
++    ("`calendar_date`", "BIGQUERY"),
++    ("((calendar_date))", "ANSI_SQL"),
++    ("calendar.calendar_date", "ANSI_SQL"),
++])
++def test_direct_reference_uses_physical_table_not_dataset_alias(expression, dialect):
++    element = _element(_document(expression=expression, dialect=dialect))
++    assert element["source"]["path"] == ["db", "schema", "dim_date_vw"]
++    assert element["columns"][0]["formula"] == "[dim_date_vw/calendar_date]"
++    assert "name" not in element["columns"][0]
++
++
++def test_original_issue_same_dataset_and_table_name():
++    element = _element(_document(dataset_name="dim_date_vw"))
++    assert element["columns"][0]["formula"] == "[dim_date_vw/calendar_date]"
++
++
++def test_renamed_field_preserves_its_display_name_and_source_column():
++    column = _element(_document(field_name="posting_date"))["columns"][0]
++    assert column["name"] == "posting_date"
++    assert column["formula"] == "[dim_date_vw/calendar_date]"
++
++
++def test_primary_sql_expression_gets_the_same_direct_reference():
++    column = _element(_document(primary_sql=True))["columns"][0]
++    assert column["formula"] == "[dim_date_vw/calendar_date]"
++
++
++def test_physical_identifier_case_is_preserved():
++    element = _element(_document(source="db.schema.DIM_DATE_VW", expression='"CALENDAR_DATE"',
++                                 dialect="SNOWFLAKE", field_name="CALENDAR_DATE"))
++    assert element["columns"][0]["formula"] == "[DIM_DATE_VW/CALENDAR_DATE]"
++
++
++def test_native_sigma_formula_is_not_rewritten():
++    element = _element(_document(sigma_formula="[preserved/calendar_date]"))
++    assert element["columns"][0]["formula"] == "[preserved/calendar_date]"
++
++
++def test_native_column_formula_override_still_wins():
++    element = _element(_document(native_formula="Date([manual/date])"))
++    assert element["columns"][0]["formula"] == "Date([manual/date])"
++
++
++@pytest.mark.parametrize("kind", ["sql", "table", "data-model", "join", "union"])
++def test_non_warehouse_source_formula_and_source_are_unchanged(kind):
++    source = {"kind": kind, "elementId": "input", "connectionId": "test"}
++    element = _element(_document(source_override=source))
++    assert element["source"] == source
++    assert element["columns"][0]["formula"] == "[calendar_date]"
++
++
++def test_native_source_override_controls_physical_reference():
++    source = {"kind": "warehouse-table", "path": ["other", "schema", "NATIVE_DATE"]}
++    element = _element(_document(native_source=source))
++    assert element["source"] == source
++    assert element["columns"][0]["formula"] == "[NATIVE_DATE/calendar_date]"
++
++
++def test_native_non_warehouse_source_does_not_get_a_table_prefix():
++    source = {"kind": "sql", "sql": "SELECT calendar_date FROM dates"}
++    element = _element(_document(native_source=source))
++    assert element["source"] == source
++    assert element["columns"][0]["formula"] == "[calendar_date]"
++
++
++def test_calculated_columns_and_metrics_keep_element_local_references():
++    document = OssieDocument.model_validate({"version": "0.2.0.dev0", "name": "sales", "datasets": [
++        {"name": "orders", "source": "db.public.ORDER_FACT", "fields": [
++            {"name": "amount", "expression": {"sql": "amount"}},
++            {"name": "discount", "expression": {"sql": "amount * 0.9"}},
++        ]}], "metrics": [{"name": "total", "expression": {"sql": "SUM(orders.amount)"}}]})
++    element = _element(document)
++    assert [c["formula"] for c in element["columns"]] == ["[ORDER_FACT/amount]", "([amount] * 0.9)"]
++    assert element["metrics"][0]["formula"] == "Sum([amount])"
++
++
++@pytest.mark.parametrize("expression,expected", [
++    ("other.calendar_date", "[other/calendar_date]"),
++    ("dim_date_vw.calendar_date", "[dim_date_vw/calendar_date]"),
++    ("42", "42"),
++    ("calendar_date + 1", "([calendar_date] + 1)"),
++])
++def test_other_qualifiers_and_non_column_expressions_are_unchanged(expression, expected):
++    assert _element(_document(expression=expression))["columns"][0]["formula"] == expected
++
++
++def test_identical_field_names_keep_separate_physical_sources():
++    document = _document().model_dump(mode="json", by_alias=True, exclude_none=True)
++    document["datasets"].append(_document(dataset_name="other", source="db.other.other_dates").model_dump(
++        mode="json", by_alias=True, exclude_none=True)["datasets"][0])
++    result = OssieToSigmaConverter().convert(OssieDocument.model_validate(document)).output
++    assert [e["columns"][0]["formula"] for e in result["pages"][0]["elements"]] == [
++        "[dim_date_vw/calendar_date]", "[other_dates/calendar_date]"]
++
++
++def test_three_round_trips_preserve_qualified_formula_and_ids():
++    document = _document(field_name="posting_date")
++    original = OssieToSigmaConverter().convert(document).output
++    assert original["pages"][0]["elements"][0]["columns"][0]["formula"] == "[dim_date_vw/calendar_date]"
++    for _ in range(3):
++        document = SigmaToOssieConverter().convert(json.loads(json.dumps(original))).output
++        actual = OssieToSigmaConverter().convert(document).output
++        assert actual == original
++        original = actual
++
++
++def test_real_cli_export_import_export_uses_source_reference(tmp_path):
++    source, native, restored, again = [tmp_path / name for name in ("model.yaml", "sigma.json", "restored.yaml", "again.json")]
++    source.write_text(yaml.safe_dump(_document().model_dump(mode="json", by_alias=True, exclude_none=True)))
++    for command, input_path, output_path in [
++        ("ossie-to-sigma", source, native), ("sigma-to-ossie", native, restored),
++        ("ossie-to-sigma", restored, again),
++    ]:
++        result = subprocess.run([sys.executable, "-m", "ossie_sigma.cli", command,
++                                 "-i", str(input_path), "-o", str(output_path)],
++                                capture_output=True, text=True, check=False, timeout=30)
++        assert result.returncode == 0, result.stderr
++    first = json.loads(native.read_text())
++    assert first["pages"][0]["elements"][0]["columns"][0]["formula"] == "[dim_date_vw/calendar_date]"
++    assert json.loads(again.read_text()) == first
