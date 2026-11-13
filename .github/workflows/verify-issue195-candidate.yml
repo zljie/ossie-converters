@@ -1,0 +1,148 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Issue 195 Sigma candidate matrix
+on:
+  push:
+    branches: [verify/issue195-sigma-source-20261113]
+    paths:
+      - verification/issue195/**
+      - .github/workflows/verify-issue195-candidate.yml
+permissions:
+  contents: read
+jobs:
+  verify:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    env:
+      SOURCE_SHA: 7bd9c32614fd884f14624fa98289ff556eb68a49
+      PATCH_SHA256: 1dbb8cd4036acf66044f4916c2098036eea5d4520edbe7f19671aadceddae2e4
+    steps:
+      - name: Read the candidate from this exact verification commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          path: proposal
+          persist-credentials: false
+      - name: Read the complete pinned upstream source and SDK submodule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: apache/ossie-converters
+          ref: 7bd9c32614fd884f14624fa98289ff556eb68a49
+          path: source
+          submodules: recursive
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Check the pinned baseline and run its entire Sigma suite
+        working-directory: source/sigma
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/issue195"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          echo "$PATCH_SHA256  $GITHUB_WORKSPACE/proposal/verification/issue195/candidate.patch" | sha256sum --check
+          git submodule status --recursive | tee "$RUNNER_TEMP/issue195/submodules.txt"
+          sha256sum uv.lock | tee "$RUNNER_TEMP/issue195/lock-sha256.txt"
+          uv sync --frozen
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/issue195/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/issue195/baseline.log"
+      - name: Prove the new regressions fail on unmodified production code
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git apply --include=sigma/tests/test_warehouse_source_references.py "$GITHUB_WORKSPACE/proposal/verification/issue195/candidate.patch"
+          cd sigma
+          set +e
+          uv run --no-sync pytest -q tests/test_warehouse_source_references.py --junitxml="$RUNNER_TEMP/issue195/red.xml" 2>&1 | tee "$RUNNER_TEMP/issue195/red.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" = 1
+          python - <<'PY'
+          import os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          report = ET.parse(Path(os.environ['RUNNER_TEMP']) / 'issue195/red.xml').getroot()
+          assert len(list(report.iter('testcase'))) == 27
+          assert len(list(report.iter('failure'))) == 15
+          assert not list(report.iter('error')) and not list(report.iter('skipped'))
+          PY
+      - name: Apply the minimal candidate and run the entire Sigma suite
+        working-directory: source
+        run: |
+          set -euo pipefail
+          git apply --exclude=sigma/tests/test_warehouse_source_references.py "$GITHUB_WORKSPACE/proposal/verification/issue195/candidate.patch"
+          git add sigma/src/ossie_sigma/ossie_to_sigma.py sigma/src/ossie_sigma/sigma_formula.py sigma/tests/test_ossie_to_sigma.py sigma/tests/test_warehouse_source_references.py sigma/README.md
+          git diff --cached --check
+          git diff --cached --stat | tee "$RUNNER_TEMP/issue195/change-stat.txt"
+          git write-tree | tee "$RUNNER_TEMP/issue195/tested-tree.txt"
+          git diff --cached --name-only | tee "$RUNNER_TEMP/issue195/changed-paths.txt"
+          cd sigma
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/issue195/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/issue195/candidate.log"
+      - name: Run the issue's exact CLI input and record the verified result
+        working-directory: source/sigma
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/issue195/repro.yaml" <<'YAML'
+          version: 0.2.0.dev0
+          name: repro
+          datasets:
+            - name: dim_date_vw
+              source: db.schema.dim_date_vw
+              primary_key: [calendar_date]
+              fields:
+                - name: calendar_date
+                  expression:
+                    dialects:
+                      - dialect: ANSI_SQL
+                        expression: calendar_date
+          YAML
+          uv run --no-sync ossie-sigma ossie-to-sigma -i "$RUNNER_TEMP/issue195/repro.yaml" -o "$RUNNER_TEMP/issue195/fixed.json"
+          uv run --no-sync python - <<'PY'
+          import hashlib, json, os, sys, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue195'
+          def report(name):
+              tree = ET.parse(root / (name + '.xml')).getroot()
+              return {'tests':len(list(tree.iter('testcase'))),'failures':len(list(tree.iter('failure'))),'errors':len(list(tree.iter('error'))),'skipped':len(list(tree.iter('skipped')))}
+          baseline, red, candidate = [report(name) for name in ('baseline','red','candidate')]
+          assert baseline == {'tests':175,'failures':0,'errors':0,'skipped':0}, baseline
+          assert candidate == {'tests':202,'failures':0,'errors':0,'skipped':0}, candidate
+          output = json.loads((root/'fixed.json').read_text())
+          formula = output['pages'][0]['elements'][0]['columns'][0]['formula']
+          assert formula == '[dim_date_vw/calendar_date]', formula
+          paths = (root/'changed-paths.txt').read_text().splitlines()
+          assert set(paths) == {'sigma/src/ossie_sigma/ossie_to_sigma.py','sigma/src/ossie_sigma/sigma_formula.py','sigma/tests/test_ossie_to_sigma.py','sigma/tests/test_warehouse_source_references.py','sigma/README.md'}, paths
+          data = {'upstream_source_sha':os.environ['SOURCE_SHA'],'verification_commit':os.environ['GITHUB_SHA'],'patch_sha256':os.environ['PATCH_SHA256'],'tested_tree':(root/'tested-tree.txt').read_text().strip(),'python':sys.version,'baseline':baseline,'expected_red':red,'candidate':candidate,'cli_formula':formula,'changed_paths':paths,'sigma_platform_query_executed':False,'apache_upstream_ci_executed':False}
+          (root/'result.json').write_text(json.dumps(data,indent=2)+'\n')
+          print(json.dumps(data,indent=2))
+          PY
+      - name: Upload auditable logs and JUnit reports
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue195-python-${{ matrix.python }}
+          path: ${{ runner.temp }}/issue195/
+          if-no-files-found: error
+          retention-days: 14
