@@ -1,0 +1,137 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+
+name: Issue 195 independent Sigma reproduction
+on:
+  push:
+    branches: [verify/issue195-sigma-source-20261113]
+    paths: [.github/workflows/verify-issue195-sigma.yml]
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SOURCE_SHA: 7bd9c32614fd884f14624fa98289ff556eb68a49
+    steps:
+      - name: Check out the complete pinned upstream source and submodule
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          repository: apache/ossie-converters
+          ref: 7bd9c32614fd884f14624fa98289ff556eb68a49
+          path: source
+          submodules: recursive
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.13'
+      - name: Install uv
+        uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Install the exact locked dependencies
+        working-directory: source/sigma
+        run: uv sync --frozen
+      - name: Run the unmodified full Sigma suite
+        working-directory: source/sigma
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/issue195/evidence"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git rev-parse HEAD | tee "$RUNNER_TEMP/issue195/evidence/source-sha.txt"
+          git submodule status --recursive | tee "$RUNNER_TEMP/issue195/evidence/submodules.txt"
+          sha256sum uv.lock | tee "$RUNNER_TEMP/issue195/evidence/uv-lock-sha256.txt"
+          uv run --no-sync python --version
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/issue195/evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/issue195/evidence/baseline.log"
+      - name: Reproduce the issue through the real converter CLI
+        working-directory: source/sigma
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/issue195/evidence/repro.yaml" <<'YAML'
+          version: 0.2.0.dev0
+          name: repro
+          datasets:
+            - name: dim_date_vw
+              source: db.schema.dim_date_vw
+              primary_key: [calendar_date]
+              fields:
+                - name: calendar_date
+                  expression:
+                    dialects:
+                      - dialect: ANSI_SQL
+                        expression: calendar_date
+          YAML
+          uv run --no-sync ossie-sigma ossie-to-sigma -i "$RUNNER_TEMP/issue195/evidence/repro.yaml" -o "$RUNNER_TEMP/issue195/evidence/actual.json" 2>&1 | tee "$RUNNER_TEMP/issue195/evidence/cli.log"
+          cat > "$RUNNER_TEMP/issue195/test_expected_reference.py" <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          def test_direct_warehouse_column_uses_source_reference():
+              output = json.loads((Path(os.environ['RUNNER_TEMP']) / 'issue195/evidence/actual.json').read_text())
+              formula = output['pages'][0]['elements'][0]['columns'][0]['formula']
+              assert formula == '[dim_date_vw/calendar_date]'
+          PY
+          set +e
+          uv run --no-sync pytest -q "$RUNNER_TEMP/issue195/test_expected_reference.py" --junitxml="$RUNNER_TEMP/issue195/evidence/red.xml" 2>&1 | tee "$RUNNER_TEMP/issue195/evidence/red.log"
+          rc=${PIPESTATUS[0]}
+          set -e
+          test "$rc" = 1
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue195/evidence'
+          doc = json.loads((root / 'actual.json').read_text())
+          actual = doc['pages'][0]['elements'][0]['columns'][0]['formula']
+          report = ET.parse(root / 'red.xml').getroot()
+          cases = list(report.iter('testcase'))
+          assert len(cases) == 1
+          assert len(list(report.iter('failure'))) == 1
+          assert not list(report.iter('error')) and not list(report.iter('skipped'))
+          assert actual == '[calendar_date]', actual
+          evidence = {'source_sha': os.environ['SOURCE_SHA'], 'cli_executed': True, 'actual_formula': actual, 'expected_formula': '[dim_date_vw/calendar_date]', 'regression_reproduced': True, 'sigma_platform_query_executed': False}
+          (root / 'reproduction.json').write_text(json.dumps(evidence, indent=2) + '\n')
+          print(json.dumps(evidence, indent=2))
+          PY
+      - name: Preserve complete public source and locked dependencies for offline validation
+        working-directory: source/sigma
+        run: |
+          set -euo pipefail
+          uv pip list --python .venv/bin/python --format json > "$RUNNER_TEMP/issue195/evidence/installed-packages.json"
+          python - <<'PY'
+          import json, os, subprocess, sys
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'issue195'
+          packages = json.loads((root / 'evidence/installed-packages.json').read_text())
+          requirements = [p['name'] + '==' + p['version'] for p in packages if p['name'] not in ('apache-ossie', 'apache-ossie-sigma') and not p.get('editable_project_location')]
+          (root / 'requirements-offline.txt').write_text('\n'.join(requirements) + '\n')
+          subprocess.run([sys.executable, '-m', 'pip', 'download', '--only-binary=:all:', '--dest', str(root / 'wheelhouse'), *requirements], check=True)
+          PY
+          tar --exclude=.git --exclude=.venv --exclude=__pycache__ --exclude=.pytest_cache -czf "$RUNNER_TEMP/issue195/complete-source.tar.gz" -C "$GITHUB_WORKSPACE" source
+          sha256sum "$RUNNER_TEMP/issue195/complete-source.tar.gz" > "$RUNNER_TEMP/issue195/evidence/source-archive-sha256.txt"
+          git status --porcelain | tee "$RUNNER_TEMP/issue195/evidence/source-status.txt"
+      - name: Upload reproduction evidence and offline workspace
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: issue195-reproduction-and-source
+          path: ${{ runner.temp }}/issue195/
+          if-no-files-found: error
+          retention-days: 14
