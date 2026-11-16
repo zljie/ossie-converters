@@ -1,0 +1,71 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR121 exact-tree Apache RAT validation
+on:
+  push:
+    branches: ['verify/pr121-license-refresh-20261116']
+permissions:
+  contents: read
+jobs:
+  rat:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78
+        with:
+          java-version: '21'
+          distribution: temurin
+      - name: Preserve exact preparation inputs
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence"
+          cp .pr121-refresh/prepare.py "$RUNNER_TEMP/tools/"
+          echo "FIXED_DATE=$(git show -s --format=%cI 21380d255ac64ac974e56590283f1e4d47ac2455)" >> "$GITHUB_ENV"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git 6cc4392bb82f03511944e33af987f37025c25f64
+          git checkout --detach 6cc4392bb82f03511944e33af987f37025c25f64
+          git submodule update --init --recursive
+      - name: Official Apache RAT on unmodified upstream
+        run: |
+          set -euo pipefail
+          dev/check-license 2>&1 | tee "$RUNNER_TEMP/evidence/baseline-rat.log"
+      - name: Reconstruct exact candidate used by the four-version regression
+        run: python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/evidence"
+      - name: Official Apache RAT on candidate
+        run: |
+          set -euo pipefail
+          dev/check-license 2>&1 | tee "$RUNNER_TEMP/evidence/candidate-rat.log"
+          git diff --exit-code
+          git diff --cached --exit-code
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/head.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/evidence/tree.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: pr121-refresh-rat
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 30
