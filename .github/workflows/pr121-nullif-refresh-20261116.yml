@@ -1,0 +1,244 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements. See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership. The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License. You may obtain a copy of the License at
+#
+#   http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied. See the License for the
+# specific language governing permissions and limitations
+# under the License.
+name: PR121 latest-upstream full validation
+on:
+  push:
+    branches: ['verify/pr121-nullif-refresh-20261116']
+permissions:
+  contents: read
+env:
+  ORIGINAL: b01e15f5f737c340df6b4ea05b15b708fed67f64
+  UPSTREAM: 6cc4392bb82f03511944e33af987f37025c25f64
+  ORIGINAL_BRANCH: fix/dbt-ratio-private-helpers-20261102
+  CANDIDATE_BRANCH: verify/pr121-nullif-tested-20261116
+jobs:
+  dbt:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ['3.11', '3.12', '3.13', '3.14']
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Pin sources and preserve reviewed preparation script
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence"
+          cp .pr121-refresh/prepare.py "$RUNNER_TEMP/tools/"
+          echo "FIXED_DATE=$(git show -s --format=%cI HEAD)" >> "$GITHUB_ENV"
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git cat-file -e "$ORIGINAL^{commit}"
+          git checkout --detach "$UPSTREAM"
+          git submodule update --init --recursive
+      - name: Full unmodified upstream dbt regression
+        working-directory: dbt
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}' 2>&1 | tee "$RUNNER_TEMP/evidence/baseline-sync.log"
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/evidence/baseline.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/baseline.log"
+      - name: Perform full-repository merge and verify exact candidate tree
+        run: python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/evidence"
+      - name: Full candidate dbt regression including real CLI round trips
+        working-directory: dbt
+        run: |
+          set -euo pipefail
+          uv sync --frozen --python '${{ matrix.python }}' 2>&1 | tee "$RUNNER_TEMP/evidence/candidate-sync.log"
+          uv run --no-sync pytest -q --junitxml="$RUNNER_TEMP/evidence/candidate.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/candidate.log"
+      - name: Validate JUnit and source cleanliness
+        run: |
+          set -euo pipefail
+          git diff --exit-code
+          git diff --cached --exit-code
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+          python - <<'PY'
+          import json, os, subprocess, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP']) / 'evidence'
+          record = json.loads((root / 'prepared.json').read_text())
+          assert subprocess.check_output(['git', 'rev-parse', 'HEAD^{tree}'], text=True).strip() == record['tree']
+          suites = {}
+          for name in ('baseline', 'candidate'):
+              report = ET.parse(root / f'{name}.xml').getroot()
+              cases = list(report.iter('testcase'))
+              assert cases and not any(list(report.iter(tag)) for tag in ('failure', 'error', 'skipped'))
+              suites[name] = {'tests': len(cases), 'failures': 0, 'errors': 0, 'skipped': 0}
+          record.update(python='${{ matrix.python }}', tests_executed=True, suites=suites)
+          (root / 'prepared.json').write_text(json.dumps(record, indent=2) + '\n')
+          print(json.dumps(record, indent=2))
+          PY
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: pr121-refresh-dbt-${{ matrix.python }}
+          path: ${{ runner.temp }}/evidence/
+          if-no-files-found: error
+          retention-days: 30
+  interop:
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        source: [baseline, candidate]
+    env:
+      UV_PYTHON: '3.12'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-java@77dd5b2ce225ea11469928ac317850245a74ae78
+        with:
+          java-version: '21'
+          distribution: temurin
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2
+        with:
+          version: '0.12.19'
+      - name: Prepare exact baseline or candidate
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/evidence"
+          cp .pr121-refresh/prepare.py "$RUNNER_TEMP/tools/"
+          export FIXED_DATE=$(git show -s --format=%cI HEAD)
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$UPSTREAM"
+          git submodule update --init --recursive
+          if [ '${{ matrix.source }}' = candidate ]; then
+            python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/evidence"
+          fi
+          git rev-parse HEAD > "$RUNNER_TEMP/evidence/head.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/evidence/tree.txt"
+      - name: Full interoperability harness tests
+        run: |
+          set -euo pipefail
+          uv sync --project interop --locked 2>&1 | tee "$RUNNER_TEMP/evidence/sync.log"
+          uv run --project interop --locked pytest interop/tests -q --junitxml="$RUNNER_TEMP/evidence/harness.xml" 2>&1 | tee "$RUNNER_TEMP/evidence/harness.log"
+      - name: Full native interop report-only matrix
+        run: |
+          set -euo pipefail
+          uv run --project interop --locked python -m interop --native --output interop/.runs/pr121-refresh 2>&1 | tee "$RUNNER_TEMP/evidence/matrix.log"
+      - name: Check source cleanliness and collect report
+        if: always()
+        run: |
+          set -euo pipefail
+          if [ -d interop/.runs/pr121-refresh ]; then
+            cp -a interop/.runs/pr121-refresh "$RUNNER_TEMP/evidence/interop"
+          fi
+          git status --porcelain > "$RUNNER_TEMP/evidence/status.txt"
+          git diff --exit-code
+          git diff --cached --exit-code
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: pr121-refresh-interop-${{ matrix.source }}
+          path: ${{ runner.temp }}/evidence/
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 30
+  publish-tested-candidate:
+    needs: [dbt, interop]
+    if: github.repository == 'zljie/ossie-converters'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      actions: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 0
+      - name: Obtain this run's complete validation evidence
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh run download "$GITHUB_RUN_ID" --repo "$GITHUB_REPOSITORY" --pattern 'pr121-refresh-*' --dir "$RUNNER_TEMP/validated"
+      - name: Reconstruct the exact tested commit
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/publication"
+          cp .pr121-refresh/prepare.py "$RUNNER_TEMP/tools/"
+          export FIXED_DATE=$(git show -s --format=%cI HEAD)
+          git config user.name zljie
+          git config user.email '44569452+zljie@users.noreply.github.com'
+          git fetch --no-tags https://github.com/apache/ossie-converters.git "$UPSTREAM"
+          git checkout --detach "$UPSTREAM"
+          python "$RUNNER_TEMP/tools/prepare.py" "$RUNNER_TEMP/publication"
+          python - <<'PY'
+          import json, os, xml.etree.ElementTree as ET
+          from pathlib import Path
+          root = Path(os.environ['RUNNER_TEMP'])
+          expected = json.loads((root / 'publication/prepared.json').read_text())
+          records = list((root / 'validated').glob('pr121-refresh-dbt-*/prepared.json'))
+          assert len(records) == 4
+          versions = set()
+          for path in records:
+              item = json.loads(path.read_text())
+              assert all(item[k] == expected[k] for k in ('original', 'upstream', 'tree', 'candidate_commit', 'files', 'sha256'))
+              assert item['tests_executed'] is True
+              versions.add(item['python'])
+              for name in ('baseline', 'candidate'):
+                  report = ET.parse(path.parent / f'{name}.xml').getroot()
+                  assert list(report.iter('testcase'))
+                  assert not any(list(report.iter(tag)) for tag in ('failure', 'error', 'skipped'))
+          assert versions == {'3.11', '3.12', '3.13', '3.14'}
+          for label in ('baseline', 'candidate'):
+              path = root / 'validated' / f'pr121-refresh-interop-{label}'
+              report = ET.parse(path / 'harness.xml').getroot()
+              assert list(report.iter('testcase'))
+              assert not any(list(report.iter(tag)) for tag in ('failure', 'error'))
+              findings = json.loads((path / 'interop/results.json').read_text())
+              assert not findings['harness_errors']
+              if label == 'candidate':
+                  assert (path / 'tree.txt').read_text().strip() == expected['tree']
+          print('Exact candidate passed all four full dbt suites and both full interop harness runs.')
+          print('Native interop remains report-only; individual findings require comparison, not an all-green claim.')
+          PY
+      - name: Publish only a new tested candidate branch
+        run: |
+          set -euo pipefail
+          test "$(git ls-remote --exit-code origin "refs/heads/$ORIGINAL_BRANCH" | cut -f1)" = "$ORIGINAL"
+          test "$(git ls-remote --exit-code https://github.com/apache/ossie-converters.git refs/heads/main | cut -f1)" = "$UPSTREAM"
+          test -z "$(git ls-remote origin "refs/heads/$CANDIDATE_BRANCH")"
+          git diff --quiet "$UPSTREAM" HEAD -- .github .gitmodules ossie
+          git push origin "HEAD:refs/heads/$CANDIDATE_BRANCH"
+          git rev-parse HEAD > "$RUNNER_TEMP/publication/head.txt"
+          git rev-parse 'HEAD^{tree}' > "$RUNNER_TEMP/publication/tree.txt"
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
+        if: always()
+        with:
+          name: pr121-refresh-publication
+          path: ${{ runner.temp }}/publication/
+          if-no-files-found: error
+          retention-days: 30
